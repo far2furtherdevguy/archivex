@@ -4,43 +4,77 @@ Patches the Android project that `flutter create` scaffolds fresh on every CI ru
 ArchiveX has the storage permissions, app label and Gradle reliability settings it needs.
 
 Run after `flutter create --platforms=android .` and before `flutter build apk`.
-Safe to run multiple times (idempotent).
+Safe to run multiple times (idempotent) and safe regardless of the exact
+attributes the installed Flutter version's template already puts on
+<manifest>/<application> (it overwrites existing attributes in place instead
+of appending duplicates, which is what previously produced invalid XML and
+broke `processReleaseManifest`).
 """
 import re
 import sys
+import xml.dom.minidom
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ANDROID = ROOT / "android"
 
 
+def _set_attr(tag_text: str, attr: str, value: str) -> str:
+    """Set attr="value" on an XML opening tag, overwriting it if already present
+    instead of appending a duplicate (duplicate attributes make the file invalid
+    XML and fail manifest parsing outright)."""
+    pattern = re.compile(re.escape(attr) + r'\s*=\s*"[^"]*"')
+    if pattern.search(tag_text):
+        return pattern.sub(f'{attr}="{value}"', tag_text, count=1)
+    # Not present yet: insert just before the tag's closing '>'.
+    assert tag_text.endswith(">") and not tag_text.endswith("/>")
+    return tag_text[:-1].rstrip() + f'\n    {attr}="{value}">'
+
+
+def _replace_tag(text: str, tag_regex: str, mutate) -> str:
+    m = re.search(tag_regex, text, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"Could not find tag matching {tag_regex!r}")
+    original = m.group(0)
+    updated = mutate(original)
+    return text[: m.start()] + updated + text[m.end() :]
+
+
 def patch_manifest():
     manifest = ANDROID / "app" / "src" / "main" / "AndroidManifest.xml"
     text = manifest.read_text()
 
-    if "xmlns:tools" not in text:
-        text = text.replace(
-            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"",
-            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n"
-            "    xmlns:tools=\"http://schemas.android.com/tools\"",
-            1,
-        )
+    # Ensure xmlns:tools is declared on <manifest> (needed for tools:ignore below).
+    text = _replace_tag(
+        text,
+        r"<manifest\b[^>]*>",
+        lambda tag: _set_attr(tag, "xmlns:tools", "http://schemas.android.com/tools"),
+    )
 
-    permissions = """    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
-"""
+    # Insert the storage permissions once, right after <manifest ...>.
     if "MANAGE_EXTERNAL_STORAGE" not in text:
-        text = re.sub(r"(<manifest\b[^>]*>)", r"\1\n" + permissions, text, count=1)
-
-    if 'android:requestLegacyExternalStorage' not in text:
-        text = text.replace(
-            "<application",
-            '<application\n        android:requestLegacyExternalStorage="true"\n        android:label="ArchiveX"',
-            1,
+        permissions = (
+            '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" '
+            'android:maxSdkVersion="32" />\n'
+            '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" '
+            'android:maxSdkVersion="32" />\n'
+            '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" '
+            'tools:ignore="ScopedStorage" />\n'
         )
-    else:
-        text = text.replace('android:label="archivex"', 'android:label="ArchiveX"')
+        m = re.search(r"<manifest\b[^>]*>", text, re.DOTALL)
+        insert_at = m.end()
+        text = text[:insert_at] + "\n" + permissions + text[insert_at:]
+
+    # Set (not append) the app label and legacy-storage flag on <application>.
+    text = _replace_tag(
+        text,
+        r"<application\b[^>]*>",
+        lambda tag: _set_attr(_set_attr(tag, "android:label", "ArchiveX"),
+                               "android:requestLegacyExternalStorage", "true"),
+    )
+
+    # Fail loudly here rather than downstream in Gradle if something is still broken.
+    xml.dom.minidom.parseString(text)
 
     manifest.write_text(text)
     print(f"patched {manifest}")

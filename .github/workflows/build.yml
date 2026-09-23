@@ -1,0 +1,90 @@
+name: Build ArchiveX APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # lib/ and pubspec.yaml are the only source of truth committed to the repo.
+      # `flutter create` below will scaffold a fresh android/ folder into the same
+      # directory; back our files up first so nothing we wrote gets clobbered.
+      - name: Back up app source
+        run: |
+          mkdir -p /tmp/src-backup
+          cp pubspec.yaml /tmp/src-backup/pubspec.yaml
+          cp -r lib /tmp/src-backup/lib
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # Gradle's cache directory (~/.gradle/caches) holds every dependency it
+      # resolves from Google's Maven repo and Maven Central, so restoring it
+      # here means a warm build re-downloads nothing and never gets rate-limited.
+      - name: Cache Gradle & Android SDK artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.android/cache
+          key: gradle-${{ runner.os }}-${{ env.FLUTTER_VERSION }}-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ env.FLUTTER_VERSION }}-
+            gradle-${{ runner.os }}-
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Scaffold Android project
+        # `flutter create` regenerates android/ (and, harmlessly, ios/ etc.) from
+        # scratch every run, so the repo never has to carry generated Gradle
+        # scaffolding and there's nothing stale to conflict with the Flutter
+        # version this job just installed.
+        run: |
+          flutter create --platforms=android --org com.archivex --project-name archivex .
+
+      - name: Restore app source
+        run: |
+          cp /tmp/src-backup/pubspec.yaml pubspec.yaml
+          rm -rf lib
+          cp -r /tmp/src-backup/lib lib
+
+      - name: Patch Android manifest & Gradle settings
+        run: python3 scripts/patch_android.py
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release --split-per-abi
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: archivex-apk
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
